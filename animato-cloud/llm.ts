@@ -83,9 +83,12 @@ const modelReady = (p: string, m: string) => (modelRest.get(`${p}:${m}`) || 0) <
 function classify(status: number, body: string, headers?: Headers): { kind: 'rate' | 'quota' | 'auth' | 'model' | 'server' | 'format' | 'other'; restMs: number } {
   const b = String(body || '');
   const retry = Number(headers?.get('retry-after')) || 0;
+  // A model that is restricted to certain apps (OpenRouter 403 "only available on…") is the MODEL's problem, not the key's.
+  if (/only available|not available (on|for|in)|agentic|harness|not allowed for this model|does not have access to (this )?model|model.*(restricted|gated)/i.test(b) && status !== 401) return { kind: 'model', restMs: 24 * 3600_000 };
   if (status === 401 || status === 403 || /API_KEY_INVALID|invalid api key|ACCESS_TOKEN_TYPE_UNSUPPORTED|permission_denied|api key not valid|has been blocked/i.test(b) && status < 500) {
     return { kind: 'auth', restMs: 6 * 3600_000 };
   }
+  if (status === 413 || /request too large|reduce your message size|context.?length|maximum context|too many tokens/i.test(b)) return { kind: 'model', restMs: 20 * 60_000 };
   if (status === 429 || /RESOURCE_EXHAUSTED|rate.?limit|quota|too many requests|tokens per (minute|day)|requests per (minute|day)/i.test(b)) {
     const daily = /per day|daily|TPD|RPD|billing|exceeded your current quota/i.test(b) && !/per minute|TPM|RPM/i.test(b);
     return { kind: daily ? 'quota' : 'rate', restMs: daily ? 60 * 60_000 : Math.min(5 * 60_000, Math.max(20_000, retry * 1000 || 45_000)) };
@@ -175,7 +178,7 @@ async function discover(provider: 'gemini' | 'groq' | 'openrouter', key: string,
 
 /** Fallback model names when discovery is impossible (offline / key rejected). */
 const DEFAULTS = {
-  gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-lite'],
+  gemini: ['gemini-3.8-flash', 'gemini-3.5-flash-lite'],
   groq: ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.6-27b'],
   openrouter: [] as string[],
 };
@@ -191,12 +194,15 @@ export class LlmPool {
   lastErrors: string[] = [];
   exhausted = new Set<string>();
   private f: typeof fetch;
-  constructor(cfg: LlmConfig) { this.cfg = cfg; this.f = cfg.fetchImpl || fetch; }
+  constructor(cfg: LlmConfig) { this.cfg = cfg; // Wrapped so `fetch` is never called with the pool as `this` (Cloudflare Workers: "Illegal invocation").
+    this.f = ((u: any, i?: any) => (cfg.fetchImpl || fetch)(u, i)) as typeof fetch; }
 
   private keys(p: 'gemini' | 'groq' | 'openrouter'): string[] { return splitKeys(p === 'gemini' ? this.cfg.geminiKeys : p === 'groq' ? this.cfg.groqKeys : this.cfg.openrouterKeys); }
   get hasKeys() { return !!this.cfg.relay || this.keys('gemini').length + this.keys('groq').length + this.keys('openrouter').length > 0; }
   get hasVision() { return !!this.cfg.relay || this.keys('gemini').length > 0 || this.keys('openrouter').length > 0 || this.keys('groq').length > 0; }
   private log(m: string) { this.cfg.log?.(m); }
+  /** The distinct recent failures, for error messages. */
+  errorSummary(n = 6): string { return [...new Set(this.lastErrors)].slice(-n).join(' | '); }
   private note(m: string) { this.lastErrors.push(m); if (this.lastErrors.length > 40) this.lastErrors.shift(); this.log(m); }
 
   /** Healthy (provider, key) slots in the order this request should try them. */
@@ -230,12 +236,12 @@ export class LlmPool {
 
   private async modelsFor(s: Slot, req: LlmRequest): Promise<ModelInfo[]> {
     const pref = s.provider === 'gemini' ? this.cfg.geminiModels : s.provider === 'groq' ? this.cfg.groqModels : this.cfg.openrouterModels;
-    const preferred = splitKeys(pref).length ? splitKeys(pref) : DEFAULTS[s.provider];
+    const preferred = splitKeys(pref);   // only what the owner configured; otherwise the live list decides
     let list = await discover(s.provider, s.key, this.f, preferred, splitKeys(this.cfg.groqVisionModels));
-    if (!list.length) list = preferred.map((id) => ({ id, vision: s.provider === 'gemini' }));
+    if (!list.length) list = DEFAULTS[s.provider].map((id) => ({ id, vision: s.provider === 'gemini' }));
     list = list.filter((m) => modelReady(s.provider, m.id));
     if (req.images?.length) list = list.filter((m) => m.vision);
-    return list.slice(0, 3);
+    return list.slice(0, s.provider === 'openrouter' ? 5 : 3);
   }
 
   /** Up to three answers (the caller stops when one is good); every failure moves to the next key. */
@@ -337,7 +343,7 @@ export class LlmPool {
     const body: any = {
       systemInstruction: { parts: [{ text: req.system }] },
       contents: [{ role: 'user', parts }],
-      generationConfig: { temperature: req.temperature ?? 0.7, maxOutputTokens: Math.max(256, (req.maxTokens || 2048) + 1024), ...(req.json ? { responseMimeType: 'application/json' } : {}) },
+      generationConfig: { temperature: req.temperature ?? 0.7, maxOutputTokens: Math.max(256, (req.maxTokens || 2048) + 1024), ...(req.json ? { responseMimeType: 'application/json' } : {}), thinkingConfig: /gemini-3/.test(model) ? { thinkingLevel: 'low' } : { thinkingBudget: 0 } },
     };
     const url = `${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`;
     const go = (headers: Record<string, string>) => this.f(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeout) });
@@ -345,6 +351,8 @@ export class LlmPool {
     let text = await res.text();
     // New-style "AQ." keys are accepted as a bearer credential on some projects.
     if (res.status === 401 && /ACCESS_TOKEN_TYPE_UNSUPPORTED|invalid authentication/i.test(text)) { res = await go({ Authorization: `Bearer ${key}` }); text = await res.text(); }
+    // This model rejects the thinking setting: ask again without it.
+    if (res.status === 400 && /thinking/i.test(text)) { delete body.generationConfig.thinkingConfig; res = await go({ 'x-goog-api-key': key }); text = await res.text(); }
     if (!res.ok) return fail(res.status, text, res.headers);
     const j = JSON.parse(text);
     const out = (j?.candidates?.[0]?.content?.parts || []).filter((p: any) => typeof p?.text === 'string' && !p.thought).map((p: any) => p.text).join('');
@@ -361,7 +369,7 @@ export class LlmPool {
     const content: any = vision ? [...req.images!.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.data}` } })), { type: 'text', text: req.user }] : req.user;
     const reasoning = /gpt-oss|qwen3|deepseek-r1|reason/i.test(model);
     const build = (withJson: boolean) => {
-      const b: any = { model, messages: [{ role: 'system', content: req.system }, { role: 'user', content }], temperature: req.temperature ?? 0.7, max_tokens: (req.maxTokens || 2048) + (reasoning ? 1500 : 0) };
+      const b: any = { model, messages: [{ role: 'system', content: req.system }, { role: 'user', content }], temperature: req.temperature ?? 0.7, max_tokens: Math.min(s.provider === 'groq' ? 8000 : 16000, (req.maxTokens || 2048) + (reasoning ? 1500 : 0)) };
       if (withJson && req.json) b.response_format = { type: 'json_object' };
       if (s.provider === 'groq' && /gpt-oss/.test(model)) b.reasoning_effort = 'low';
       return b;
